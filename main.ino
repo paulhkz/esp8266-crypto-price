@@ -61,20 +61,17 @@ void getHistory() {
   String serverName = "https://api.coingecko.com/api/v3/coins/" + coin + "/market_chart?vs_currency=" + currency + "&days=" + String(days); // the interval on auto will be hourly
 
   if (getJsonFromUrl(serverName, doc, DeserializationOption::Filter(filter))) {
-    Serial.println(doc.as<String>().c_str());
     JsonArray prices = doc["prices"];
-    long widthDifference = prices.size() - displayWidth;
+    float step = (float)prices.size() / (float)displayWidth;
 
-    if (widthDifference < 0) {
-      printError("Bigger day interval!");
-      return;
-    } // TODO: rn if there are less values than pixels, the rest will be 0, so the minimum price is also 0 which disturbs the picture
+    Serial.println(step);
 
-    unsigned int diff = widthDifference < 0 ? 0 : widthDifference;
-
-    for (int i = 0; i < displayWidth; i++) { // if the display is too short, we still want to display the right most values in the array
-      float price = String(prices[i+diff][1]).toFloat();
-      priceHistory[i] = price;
+    int arrayIndex = 0;
+    for (float priceIndex = 0; arrayIndex < displayWidth; priceIndex += step ) { // if the display is too short, we still want to display the right most values in the array
+      int priceIndexFloored = std::floor(priceIndex);
+      float price = String(prices[priceIndexFloored][1]).toFloat();
+      priceHistory[arrayIndex] = price;
+      arrayIndex++;
     }
   }
 }

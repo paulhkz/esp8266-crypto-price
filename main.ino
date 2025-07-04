@@ -2,203 +2,263 @@
 #include <U8g2lib.h>
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <ESP8266WiFiMulti.h>
 #include <ESP8266HTTPClient.h>
 #include <WiFiClientSecureBearSSL.h>
-#include <StreamUtils.h>
 
+// --- Configuration ---
+// Using const char* instead of String objects to save memory and prevent fragmentation.
+const char* ssid = "<YOUR WIFI SSID>";
+const char* password = "<YOUR WIFI PASSWORD>";
 
-// needed for oled
-U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, /* clock=*/14, /* data=*/12, /* reset=*/U8X8_PIN_NONE);  // ESP32 Thing, pure SW emulated I2C
+const char* coin = "bitcoin";
+const char* currency = "usd";
+const unsigned int days = 31; // you can see up to the last 365 days
+
+// --- OLED Display Setup ---
+U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, /* clock=*/14, /* data=*/12, /* reset=*/U8X8_PIN_NONE);
 const int displayWidth = 128;
 const int displayHeight = 64;
 
-const unsigned long postingInterval = 30 * 1000; // delay between updates, in milliseconds
+// --- Global Variables ---
+const unsigned long postingInterval = 60 * 1000; // Delay between updates
+float priceHistory[displayWidth]; // Holds the sampled data for the display graph
 
-const String ssid = "<YOUR WIFI SSID>";
-const String password = "<YOUR WIFI PASSWORD>";
-
-const String coin = "<COIN NAME>"; // e.g. bitcoin
-const String currency = "<CURRENCY NAME>"; // e.g. usd
-const unsigned int days = 7; // price history in days
-
-
-float priceHistory[displayWidth];
+// --- Forward Declarations ---
+void getHistory();
+float getPrice();
+void displayPrice(float price, char update);
+void displayHistory();
+void updatePriceHistory(float newPrice);
+bool makeApiRequest(const char* url, std::function<bool(WiFiClient& stream)> processStreamCallback);
+void printError(const char* error);
 
 
 void setup() {
-  // put your setup code here, to run once:
   Serial.begin(115200);
   Serial.println();
 
+  // Initialize display
   u8g2.begin();
-  u8g2.setFontMode(0);  // enable transparent mode, which is faster
+  u8g2.setFontMode(0);
   u8g2.setFont(u8g2_font_likeminecraft_te);
   u8g2.setCursor(11, 62);
   u8g2.print("Connecting to WiFi");
-  u8g2.sendBuffer();  // transfer internal memory to the display
+  u8g2.sendBuffer();
 
+  // Connect to WiFi
   WiFi.begin(ssid, password);
-
   Serial.print("Connecting");
-  while (WiFi.status() != WL_CONNECTED)
-  {
+  while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
   Serial.println();
-
   Serial.print("Connected, IP address: ");
   Serial.println(WiFi.localIP());
+
+  // Initial data fetch
   getHistory();
 }
 
-
-void getHistory() {
-  JsonDocument doc;
-  JsonDocument filter;
-  filter["prices"] = true;
-  String serverName = "https://api.coingecko.com/api/v3/coins/" + coin + "/market_chart?vs_currency=" + currency + "&days=" + String(days); // the interval on auto will be hourly
-
-  if (getJsonFromUrl(serverName, doc, DeserializationOption::Filter(filter))) {
-    JsonArray prices = doc["prices"];
-    float step = (float)prices.size() / (float)displayWidth;
-
-    Serial.println(step);
-
-    int arrayIndex = 0;
-    for (float priceIndex = 0; arrayIndex < displayWidth; priceIndex += step ) { // if the display is too short, we still want to display the right most values in the array
-      int priceIndexFloored = std::floor(priceIndex);
-      float price = String(prices[priceIndexFloored][1]).toFloat();
-      priceHistory[arrayIndex] = price;
-      arrayIndex++;
-    }
-  }
-}
-
 void loop() {
-  // wait for WiFi connection
-  if ((WiFi.status() == WL_CONNECTED)) {
+  if (WiFi.status() == WL_CONNECTED) {
     float newPrice = getPrice();
-    float oldPrice = priceHistory[displayWidth-1];
+    if (newPrice > 0) { // Only update if we got a valid price
+      float oldPrice = priceHistory[displayWidth - 1];
 
-    char update = '=';
-    if (oldPrice > newPrice) update = '-';
-    else if (newPrice > oldPrice) update = '+';
+      char update = '=';
+      if (oldPrice > newPrice) update = '-';
+      else if (newPrice > oldPrice) update = '+';
 
-    displayPrice(newPrice, update);
-    updatePriceHistory(newPrice);
-    displayHistory();
-
+      displayPrice(newPrice, update);
+      updatePriceHistory(newPrice);
+      displayHistory();
+    }
     delay(postingInterval);
   }
 }
 
+/**
+ * @brief Streams historical price data from the API without loading the whole JSON into memory.
+ */
+void getHistory() {
+  // For hourly data, the API returns days * 24 data points.
+  const int totalPrices = days > 90 ? days : days > 1 ? days * 24 : 285;
+  // Allocate a temporary array on the heap to store all prices from the stream.
+  float* fullPriceHistory = new float[totalPrices];
+  if (!fullPriceHistory) {
+    Serial.println("Failed to allocate memory for fullPriceHistory!");
+    printError("Out of Memory!");
+    return;
+  }
+
+  // Build the URL using snprintf for memory safety.
+  char serverName[200];
+  snprintf(serverName, sizeof(serverName),
+           "https://api.coingecko.com/api/v3/coins/%s/market_chart?vs_currency=%s&days=%u",
+           coin, currency, days);
+
+  // This lambda contains the logic to stream the large history response.
+  // It captures the variables it needs from the parent scope.
+  auto processHistoryStream = [&](WiFiClient& stream) -> bool {
+    if (stream.find("\"prices\":[[")) {
+      Serial.println("Found prices array, starting to stream...");
+      JsonDocument pricePairDoc;
+      int priceCount = 0;
+
+      DeserializationError error;
+
+      while (stream.connected() && priceCount < totalPrices && stream.find(",")) {
+        if (stream.peek() == '[') {
+          error = deserializeJson(pricePairDoc, stream);
+          if (!error) {
+            fullPriceHistory[priceCount] = pricePairDoc[1].as<float>();
+            priceCount++;
+          } else {
+            Serial.printf("deserializeJson() failed: %s\n", error.c_str());
+          }
+        }
+      }
+      Serial.printf("Finished streaming. Got %d prices.\n", priceCount);
+
+      // Sample the full history into the smaller display history array.
+      float step = (float)priceCount / (float)displayWidth;
+      for (int i = 0, arrayIndex = 0; arrayIndex < displayWidth && i < priceCount; i = std::round((arrayIndex+1) * step) ) {
+        priceHistory[arrayIndex] = fullPriceHistory[i];
+        Serial.printf("%f ", fullPriceHistory[i]);
+        arrayIndex++;
+      }
+      return true; // Success
+    } else {
+      Serial.println("Could not find 'prices' array in JSON response.");
+      printError("API Error");
+      return false; // Failure
+    }
+  };
+
+  makeApiRequest(serverName, processHistoryStream);
+
+  delete[] fullPriceHistory;
+}
+
+
+/**
+ * @brief Gets the current price of the coin.
+ * @return The current price as a float, or 0 on failure.
+ */
 float getPrice() {
-  JsonDocument doc;
-  JsonDocument filter;
-  filter[coin] = true;
-  String serverName = "https://api.coingecko.com/api/v3/simple/price?include_24hr_change=true&ids=" + coin + "&vs_currencies=" + currency + "&precision=full";
-  // alternative: "https://api.coinbase.com/v2/prices/BTC-EUR/spot"
+  char serverName[200];
+  snprintf(serverName, sizeof(serverName),
+           "https://api.coingecko.com/api/v3/simple/price?ids=%s&vs_currencies=%s&precision=full",
+           coin, currency);
+
+  float newPrice = 0;
+
+  // This lambda contains the logic to parse the simple current-price response.
+  auto processPriceStream = [&](WiFiClient& stream) -> bool {
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, stream);
+    if (error) {
+      Serial.printf("deserializeJson() failed: %s\n", error.c_str());
+      return false;
+    }
+    newPrice = doc[coin][currency].as<float>();
+    Serial.printf("%s = %.8g\n", coin, newPrice);
+    return true;
+  };
+
+  makeApiRequest(serverName, processPriceStream);
   
-  if (getJsonFromUrl(serverName, doc, DeserializationOption::Filter(filter))) {
-    float newPrice = String(doc[coin][currency]).toFloat();
-
-    Serial.print(coin);
-    Serial.print(" = ");
-    Serial.printf("%.8g",newPrice);
-
-    return newPrice;
-  } else {
-    return 0;
-  }
+  return newPrice;
 }
 
-// this is so that the current price is always the right most value to be seen as a comparison.
-void updatePriceHistory(float newPrice) {
-  priceHistory[displayWidth-1] = newPrice;
-}
-
-void displayPrice(float price, char update) {
-  u8g2.clearBuffer();                 // clear the internal memory
-
-  u8g2.setFont(u8g2_font_luBS08_te);
-  u8g2.setCursor(0, 8);
-  u8g2.print(coin + " in " + currency);  // this value must be lesser than 128 unless U8G2_16BIT is set
-  u8g2.setFont(u8g2_font_luBS12_te);
-  u8g2.setCursor(128-15, 10);
-  u8g2.print(update);
-  // u8g2.setFont(u8g2_font_bubble_tr);
-  u8g2.setFont(u8g2_font_profont29_mn);
-  u8g2.setCursor(0, 30);
-  u8g2.printf("%.7g", price);
-  u8g2.sendBuffer();  // transfer internal memory to the display
-}
-
-void displayHistory() {
-  // getting maximum and minimum
-  float *coinMin, *coinMax;
-  std::tie(coinMin, coinMax) = std::minmax_element(std::begin(priceHistory), std::end(priceHistory));
-
-  float coinDiff = *coinMax - *coinMin;
-
-  int upperPixelY = 30; // 30 is the last height of the text (see function above)
-  int pixelDiff = displayHeight - upperPixelY - 1; // 63 is the lowest value 
-
-  int pricesPixels[displayWidth];
-
-  for (int x = 0; x < displayWidth; x++) {
-    float current = priceHistory[x];
-    int y = std::round((float)(*coinMax - current) / (float)coinDiff * pixelDiff + upperPixelY); // you gotta visualize it
-
-    pricesPixels[x] = y;
-  }
-
-  for (int i = 1; i < displayWidth; i++) {
-    u8g2.drawLine(i-1, pricesPixels[i-1], i, pricesPixels[i]);
-  }
-  u8g2.sendBuffer();
-}
-
-bool getJsonFromUrl(const String& serverName, JsonDocument& doc, DeserializationOption::Filter filter) {
+/**
+ * @brief Handles the HTTPS connection and calls a lambda function to process the response stream.
+ * This centralizes the connection logic and removes code duplication.
+ * @param url The API endpoint to request.
+ * @param processStreamCallback A lambda function that takes a WiFiClient stream and returns true on success.
+ * @return True if the request and the stream processing were successful.
+ */
+bool makeApiRequest(const char* url, std::function<bool(WiFiClient& stream)> processStreamCallback) {
   std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
   client->setInsecure();
-
   HTTPClient https;
-
   https.useHTTP10(true);
 
-  if (https.begin(*client, serverName)) {
-    Serial.printf("[HTTPS] GET... %s\n", serverName.c_str());
-
+  bool success = false;
+  Serial.printf("[HTTPS] GET... %s\n", url);
+  if (https.begin(*client, url)) {
     int httpCode = https.GET();
     if (httpCode == HTTP_CODE_OK) {
-      
-      DeserializationError error = deserializeJson(doc, https.getStream(), filter);
-
-      if (error) {
-        Serial.print("deserializeJson() failed: ");
-        Serial.println(error.c_str());
-        https.end();
-        return false; // Indicate failure
-      }
-      https.end();
-      return true; // Indicate success!
+      WiFiClient& stream = https.getStream();
+      // Call the provided lambda to process the stream.
+      success = processStreamCallback(stream);
     } else {
       Serial.printf("[HTTPS] GET failed, error: %s\n", https.errorToString(httpCode).c_str());
+      printError("HTTP Error");
     }
     https.end();
   } else {
     Serial.printf("[HTTPS] Unable to connect\n");
+    printError("Connection Failed");
   }
-  return false; // Indicate failure
+  return success;
 }
 
-void printError(String error) {
+/**
+ * @brief Updates the price history array to show the latest price on the far right.
+ */
+void updatePriceHistory(float newPrice) {
+  // Add the new price at the very end
+  priceHistory[displayWidth - 1] = newPrice;
+}
+
+void displayPrice(float price, char update) {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_luBS08_te);
+  u8g2.setCursor(0, 8);
+  u8g2.printf("%s in %s", coin, currency);
+  u8g2.setFont(u8g2_font_luBS12_te);
+  u8g2.setCursor(128 - 15, 10);
+  u8g2.print(update);
+  u8g2.setFont(u8g2_font_profont29_mn);
+  u8g2.setCursor(0, 30);
+  u8g2.printf("%.7g", price);
+  // The buffer is sent in displayHistory() after the graph is drawn.
+}
+
+void displayHistory() {
+  float minPrice = priceHistory[0];
+  float maxPrice = priceHistory[0];
+  for (int i = 1; i < displayWidth; i++) {
+    if (priceHistory[i] < minPrice) minPrice = priceHistory[i];
+    if (priceHistory[i] > maxPrice) maxPrice = priceHistory[i];
+  }
+
+  float priceDiff = maxPrice - minPrice;
+  if (priceDiff == 0) priceDiff = 1; // Avoid division by zero if all prices are the same
+
+  int graphBottomY = displayHeight - 1;
+  int graphTopY = 32;
+  int graphHeight = graphBottomY - graphTopY;
+
+  int prevX = 0;
+  int prevY = std::round(((maxPrice - priceHistory[0]) / priceDiff) * graphHeight) + graphTopY;
+
+  for (int x = 1; x < displayWidth; x++) {
+    int y = std::round(((maxPrice - priceHistory[x]) / priceDiff) * graphHeight) + graphTopY;
+    u8g2.drawLine(prevX, prevY, x, y);
+    prevX = x;
+    prevY = y;
+  }
+  u8g2.sendBuffer(); // Send the price and the graph to the display at the same time
+}
+
+void printError(const char* error) {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_likeminecraft_te);
   u8g2.setCursor(0, 60);
   u8g2.print(error);
-  u8g2.sendBuffer();  // transfer internal memory to the display
-  delay(10000);
+  u8g2.sendBuffer();
+  delay(20000);
 }

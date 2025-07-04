@@ -10,9 +10,9 @@
 const char* ssid = "<YOUR WIFI SSID>";
 const char* password = "<YOUR WIFI PASSWORD>";
 
-const char* coin = "bitcoin";
-const char* currency = "usd";
-const unsigned int days = 31;
+const char* coin = "bitcoin"; // almost all coins are possible here, basically all the ones available in coingecko
+const char* currency = "usd"; // almost all currencies are possible here
+const unsigned int days = 31; // you can see up to the last 365 days
 
 // --- OLED Display Setup ---
 U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, /* clock=*/14, /* data=*/12, /* reset=*/U8X8_PIN_NONE);

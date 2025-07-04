@@ -12,7 +12,7 @@ const char* password = "<YOUR WIFI PASSWORD>";
 
 const char* coin = "bitcoin";
 const char* currency = "usd";
-const unsigned int days = 31; // you can see up to the last 365 days
+const unsigned int days = 31;
 
 // --- OLED Display Setup ---
 U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, /* clock=*/14, /* data=*/12, /* reset=*/U8X8_PIN_NONE);
@@ -20,6 +20,8 @@ const int displayWidth = 128;
 const int displayHeight = 64;
 
 // --- Global Variables ---
+const int totalPrices = days > 90 ? days : days > 1 ? days * 24 : 285;
+
 const unsigned long postingInterval = 60 * 1000; // Delay between updates
 float priceHistory[displayWidth]; // Holds the sampled data for the display graph
 
@@ -82,8 +84,6 @@ void loop() {
  * @brief Streams historical price data from the API without loading the whole JSON into memory.
  */
 void getHistory() {
-  // For hourly data, the API returns days * 24 data points.
-  const int totalPrices = days > 90 ? days : days > 1 ? days * 24 : 285;
   // Allocate a temporary array on the heap to store all prices from the stream.
   float* fullPriceHistory = new float[totalPrices];
   if (!fullPriceHistory) {
@@ -245,7 +245,7 @@ void displayHistory() {
   int prevX = 0;
   int prevY = std::round(((maxPrice - priceHistory[0]) / priceDiff) * graphHeight) + graphTopY;
 
-  for (int x = 1; x < displayWidth; x++) {
+  for (int x = 1; x < totalPrices; x++) {
     int y = std::round(((maxPrice - priceHistory[x]) / priceDiff) * graphHeight) + graphTopY;
     u8g2.drawLine(prevX, prevY, x, y);
     prevX = x;
